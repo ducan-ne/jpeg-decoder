@@ -19,12 +19,14 @@ use core::ops::Range;
 use std::io::Read;
 
 pub const MAX_COMPONENTS: usize = 4;
+const MAX_SCANS: usize = 100;
+const MAX_SCALED_CHUNK_BYTES: usize = 256 * 1024;
 
 mod lossless;
 use self::lossless::compute_image_lossless;
 
 #[rustfmt::skip]
-static UNZIGZAG: [u8; 64] = [
+const UNZIGZAG: [u8; 64] = [
      0,  1,  8, 16,  9,  2,  3, 10,
     17, 24, 32, 25, 18, 11,  4,  5,
     12, 19, 26, 33, 40, 48, 41, 34,
@@ -34,6 +36,126 @@ static UNZIGZAG: [u8; 64] = [
     58, 59, 52, 45, 38, 31, 39, 46,
     53, 60, 61, 54, 47, 55, 62, 63,
 ];
+
+const fn max_kept_zigzag(dct_scale: usize) -> u8 {
+    match dct_scale { 1 => 0, 2 => 4, 4 => 24, _ => 63 }
+}
+
+const fn slot_map(dct_scale: usize) -> [u8; 64] {
+    let (mut map, mut zz) = ([u8::MAX; 64], 0);
+    while zz < 64 {
+        let nat = UNZIGZAG[zz] as usize;
+        let (r, c) = (nat / 8, nat % 8);
+        if r < dct_scale && c < dct_scale {
+            map[zz] = (r * dct_scale + c) as u8;
+        }
+        zz += 1;
+    }
+    map
+}
+
+const fn kept_ac_mask(dct_scale: usize) -> u64 {
+    let (map, mut mask, mut zz) = (slot_map(dct_scale), 0u64, 1);
+    while zz < 64 {
+        if map[zz] != u8::MAX {
+            mask |= 1u64 << zz;
+        }
+        zz += 1;
+    }
+    mask
+}
+
+const SLOT_MAP_1: [u8; 64] = slot_map(1);
+const SLOT_MAP_2: [u8; 64] = slot_map(2);
+const SLOT_MAP_4: [u8; 64] = slot_map(4);
+const KEPT_AC_MASK_2: u64 = kept_ac_mask(2);
+const KEPT_AC_MASK_4: u64 = kept_ac_mask(4);
+
+#[inline(always)]
+fn slot_map_for<const N: usize>() -> &'static [u8; 64] {
+    match N { 1 => &SLOT_MAP_1, 4 => &SLOT_MAP_2, 16 => &SLOT_MAP_4, _ => unreachable!() }
+}
+
+struct ScaledComponent {
+    dct_scale: usize,
+    block_width: usize,
+    block_height: usize,
+    chunk_shift: u32,
+    coeff_chunks: Vec<Vec<i16>>,
+    nz_chunks: Vec<Vec<u64>>,
+}
+
+impl ScaledComponent {
+    fn new(c: &Component) -> Self {
+        let (bw, bh) = (usize::from(c.block_size.width), usize::from(c.block_size.height));
+        let row_bytes = cmp::max(1, bw * c.dct_scale * c.dct_scale * 2) as u64;
+        let mut chunk_shift = 0u32;
+        while chunk_shift < 14 && (row_bytes << (chunk_shift + 1)) <= MAX_SCALED_CHUNK_BYTES as u64 {
+            chunk_shift += 1;
+        }
+        let n = (bh + (1usize << chunk_shift) - 1) >> chunk_shift;
+        ScaledComponent {
+            dct_scale: c.dct_scale,
+            block_width: bw,
+            block_height: bh,
+            chunk_shift,
+            coeff_chunks: vec![Vec::new(); n],
+            nz_chunks: if c.dct_scale > 1 { vec![Vec::new(); n] } else { Vec::new() },
+        }
+    }
+
+    #[inline(always)]
+    fn block_mut<const N: usize>(
+        &mut self,
+        bx: usize,
+        by: usize,
+        read_nz: bool,
+        write_nz: bool,
+    ) -> (&mut [i16; N], u64, Option<&mut u64>) {
+        let (ci, ri) = (by >> self.chunk_shift, by & ((1usize << self.chunk_shift) - 1));
+        let rows = cmp::min(1usize << self.chunk_shift, self.block_height - (ci << self.chunk_shift));
+        let idx = ri * self.block_width + bx;
+        let coeffs = &mut self.coeff_chunks[ci];
+        if coeffs.is_empty() {
+            *coeffs = vec![0i16; rows * self.block_width * N];
+        }
+        let slots: &mut [i16; N] = (&mut coeffs[idx * N..(idx + 1) * N]).try_into().unwrap();
+        let (nz_val, nz_out) = match self.nz_chunks.get_mut(ci) {
+            Some(nz_c) if write_nz || (read_nz && !nz_c.is_empty()) => {
+                if nz_c.is_empty() {
+                    *nz_c = vec![0u64; rows * self.block_width];
+                }
+                let slot = &mut nz_c[idx];
+                (*slot, if write_nz { Some(slot) } else { None })
+            }
+            _ => (0, None),
+        };
+        (slots, nz_val, nz_out)
+    }
+
+    fn take_mcu_row(&mut self, mcu_y: usize, v_samp: usize) -> Vec<i16> {
+        let (s, stride, chunk_rows) = (self.dct_scale, self.dct_scale * self.dct_scale, 1usize << self.chunk_shift);
+        let mut row = vec![0i16; self.block_width * v_samp * 64];
+        for v in 0..v_samp {
+            let by = mcu_y * v_samp + v;
+            let (ci, ri) = (by >> self.chunk_shift, by & (chunk_rows - 1));
+            if let Some(src_row) = self.coeff_chunks[ci]
+                .get(ri * self.block_width * stride..(ri + 1) * self.block_width * stride)
+            {
+                for (bx, src) in src_row.chunks_exact(stride).enumerate() {
+                    let dst = &mut row[(v * self.block_width + bx) * 64..][..64];
+                    for r in 0..s {
+                        dst[r * 8..r * 8 + s].copy_from_slice(&src[r * s..(r + 1) * s]);
+                    }
+                }
+                if by + 1 == cmp::min((ci + 1) << self.chunk_shift, self.block_height) {
+                    self.coeff_chunks[ci] = Vec::new();
+                }
+            }
+        }
+        row
+    }
+}
 
 /// An enumeration over combinations of color spaces and bit depths a pixel can have.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -122,6 +244,7 @@ pub struct Decoder<R> {
 
     // Used for progressive JPEGs.
     coefficients: Vec<Vec<i16>>,
+    scaled_coefficients: Vec<ScaledComponent>,
     // Bitmask of which coefficients has been completely decoded.
     coefficients_finished: [u64; MAX_COMPONENTS],
 
@@ -148,6 +271,7 @@ impl<R: Read> Decoder<R> {
             xmp_data: None,
             psir_data: None,
             coefficients: Vec::new(),
+            scaled_coefficients: Vec::new(),
             coefficients_finished: [0; MAX_COMPONENTS],
             decoding_buffer_size_limit: usize::MAX,
         }
@@ -289,6 +413,24 @@ impl<R: Read> Decoder<R> {
         Ok((frame.output_size.width, frame.output_size.height))
     }
 
+    /// Returns the maximum number of bytes that progressive coefficient buffers will allocate
+    /// during `decode` for the current frame and `scale`, or `0` if the frame is not progressive
+    /// or metadata has not been read yet.
+    pub fn progressive_coeff_bytes(&self) -> u64 {
+        let frame = match self.frame {
+            Some(ref frame) if frame.coding_process == CodingProcess::DctProgressive => frame,
+            _ => return 0,
+        };
+        frame
+            .components
+            .iter()
+            .map(|c| {
+                let block_bytes = match c.dct_scale { 1 => 2, 2 => 16, 4 => 40, _ => 128 };
+                u64::from(c.block_size.width) * u64::from(c.block_size.height) * block_bytes
+            })
+            .sum()
+    }
+
     /// Decodes the image and returns the decoded pixels if successful.
     pub fn decode(&mut self) -> Result<Vec<u8>> {
         WorkerScope::with(|worker| self.decode_internal(false, worker))
@@ -393,11 +535,17 @@ impl<R: Read> Decoder<R> {
                     if self.frame.is_none() {
                         return Err(Error::Format("scan encountered before frame".to_owned()));
                     }
+                    if scans_processed >= MAX_SCANS {
+                        return Err(Error::Format("too many scans".to_owned()));
+                    }
 
                     let frame = self.frame.clone().unwrap();
                     let scan = parse_sos(&mut self.reader, &frame)?;
+                    let use_scaled_prog = frame.coding_process == CodingProcess::DctProgressive
+                        && frame.components[0].dct_scale < 8;
 
                     if frame.coding_process == CodingProcess::DctProgressive
+                        && !use_scaled_prog
                         && self.coefficients.is_empty()
                     {
                         self.coefficients = frame
@@ -422,6 +570,46 @@ impl<R: Read> Decoder<R> {
                             planes_u16[i] = plane;
                         }
                         pending_marker = marker;
+                    } else if use_scaled_prog {
+                        if self.scaled_coefficients.is_empty() {
+                            self.scaled_coefficients =
+                                frame.components.iter().map(ScaledComponent::new).collect();
+                        }
+                        let mut already_finished = [false; MAX_COMPONENTS];
+                        for (idx, &comp_i) in scan.component_indices.iter().enumerate() {
+                            already_finished[idx] = self.coefficients_finished[comp_i] == !0;
+                        }
+                        let dct_scale = frame.components[0].dct_scale;
+                        let max_kept_zz = max_kept_zigzag(dct_scale);
+                        let kept_band = (1u64 << (max_kept_zz + 1)) - 2;
+                        let comp0 = scan.component_indices[0];
+                        let skip_scan = scan.spectral_selection.start > max_kept_zz
+                            && (already_finished[0]
+                                || dct_scale == 1
+                                || scan.successive_approximation_low == 0
+                                || (self.coefficients_finished[comp0] & kept_band) == kept_band);
+                        if scan.successive_approximation_low == 0 {
+                            for &comp_i in &scan.component_indices {
+                                for j in scan.spectral_selection.clone() {
+                                    self.coefficients_finished[comp_i] |= 1 << j;
+                                }
+                            }
+                        }
+                        if skip_scan {
+                            self.validate_scan_tables(&frame, &scan)?;
+                            pending_marker = Some(skip_scan_entropy_data(&mut self.reader)?);
+                        } else {
+                            let pref = Self::select_worker(&frame, PreferWorkerKind::Multithreaded);
+                            let (marker, _) = worker_scope.get_or_init_worker(pref, |worker| {
+                                self.decode_scan(&frame, &scan, worker, &[false; MAX_COMPONENTS], &already_finished)
+                            })?;
+                            pending_marker = marker;
+                        }
+                        for &comp_i in &scan.component_indices {
+                            if (self.coefficients_finished[comp_i] | 1) == !0 {
+                                self.scaled_coefficients[comp_i].nz_chunks = Vec::new();
+                            }
+                        }
                     } else {
                         // This was previously buggy, so let's explain the log here a bit. When a
                         // progressive frame is encoded then the coefficients (DC, AC) of each
@@ -459,7 +647,7 @@ impl<R: Read> Decoder<R> {
 
                         let (marker, data) = worker_scope
                             .get_or_init_worker(preference, |worker| {
-                                self.decode_scan(&frame, &scan, worker, &finished)
+                                self.decode_scan(&frame, &scan, worker, &finished, &[false; MAX_COMPONENTS])
                             })?;
 
                         if let Some(data) = data {
@@ -640,6 +828,29 @@ impl<R: Read> Decoder<R> {
             ));
         }
 
+        if frame.coding_process == CodingProcess::DctProgressive
+            && self.scaled_coefficients.len() == frame.components.len()
+        {
+            for sc in &mut self.scaled_coefficients {
+                sc.nz_chunks = Vec::new();
+            }
+            for (i, component) in frame.components.iter().enumerate() {
+                let quantization_table =
+                    match self.quantization_tables[component.quantization_table_index].clone() {
+                        Some(quantization_table) => quantization_table,
+                        None => continue,
+                    };
+                worker.start(RowData { index: i, component: component.clone(), quantization_table })?;
+                let v_samp = usize::from(component.vertical_sampling_factor);
+                for mcu_y in 0..usize::from(frame.mcu_size.height) {
+                    worker.append_row((i, self.scaled_coefficients[i].take_mcu_row(mcu_y, v_samp)))?;
+                }
+                self.scaled_coefficients[i].coeff_chunks = Vec::new();
+                planes[i] = worker.get_result(i)?;
+            }
+            self.scaled_coefficients = Vec::new();
+        }
+
         // If we're decoding a progressive jpeg and a component is unfinished, render what we've got
         if frame.coding_process == CodingProcess::DctProgressive
             && self.coefficients.len() == frame.components.len()
@@ -790,6 +1001,30 @@ impl<R: Read> Decoder<R> {
         }
     }
 
+    fn validate_scan_tables(&mut self, frame: &FrameInfo, scan: &ScanInfo) -> Result<()> {
+        if scan
+            .component_indices
+            .iter()
+            .any(|&i| self.quantization_tables[frame.components[i].quantization_table_index].is_none())
+        {
+            return Err(Error::Format("use of unset quantization table".to_owned()));
+        }
+        if self.is_mjpeg {
+            fill_default_mjpeg_tables(scan, &mut self.dc_huffman_tables, &mut self.ac_huffman_tables);
+        }
+        if scan.spectral_selection.start == 0
+            && scan.dc_table_indices.iter().any(|&i| self.dc_huffman_tables[i].is_none())
+        {
+            return Err(Error::Format("scan makes use of unset dc huffman table".to_owned()));
+        }
+        if scan.spectral_selection.end > 1
+            && scan.ac_table_indices.iter().any(|&i| self.ac_huffman_tables[i].is_none())
+        {
+            return Err(Error::Format("scan makes use of unset ac huffman table".to_owned()));
+        }
+        Ok(())
+    }
+
 #[allow(clippy::type_complexity)]
     fn decode_scan(
         &mut self,
@@ -797,52 +1032,16 @@ impl<R: Read> Decoder<R> {
         scan: &ScanInfo,
         worker: &mut dyn Worker,
         finished: &[bool; MAX_COMPONENTS],
+        already_finished: &[bool; MAX_COMPONENTS],
     ) -> Result<(Option<Marker>, Option<Vec<Vec<u8>>>)> {
         assert!(scan.component_indices.len() <= MAX_COMPONENTS);
+        self.validate_scan_tables(frame, scan)?;
 
         let components: Vec<Component> = scan
             .component_indices
             .iter()
             .map(|&i| frame.components[i].clone())
             .collect();
-
-        // Verify that all required quantization tables has been set.
-        if components
-            .iter()
-            .any(|component| self.quantization_tables[component.quantization_table_index].is_none())
-        {
-            return Err(Error::Format("use of unset quantization table".to_owned()));
-        }
-
-        if self.is_mjpeg {
-            fill_default_mjpeg_tables(
-                scan,
-                &mut self.dc_huffman_tables,
-                &mut self.ac_huffman_tables,
-            );
-        }
-
-        // Verify that all required huffman tables has been set.
-        if scan.spectral_selection.start == 0
-            && scan
-                .dc_table_indices
-                .iter()
-                .any(|&i| self.dc_huffman_tables[i].is_none())
-        {
-            return Err(Error::Format(
-                "scan makes use of unset dc huffman table".to_owned(),
-            ));
-        }
-        if scan.spectral_selection.end > 1
-            && scan
-                .ac_table_indices
-                .iter()
-                .any(|&i| self.ac_huffman_tables[i].is_none())
-        {
-            return Err(Error::Format(
-                "scan makes use of unset ac huffman table".to_owned(),
-            ));
-        }
 
         // Prepare the worker thread for the work to come.
         for (i, component) in components.iter().enumerate() {
@@ -861,6 +1060,11 @@ impl<R: Read> Decoder<R> {
         }
 
         let is_progressive = frame.coding_process == CodingProcess::DctProgressive;
+        let is_scaled_progressive = !self.scaled_coefficients.is_empty();
+        let read_nz = scan.spectral_selection.start > 0;
+        let write_nz = read_nz
+            && (scan.successive_approximation_low > 0
+                || (self.coefficients_finished[scan.component_indices[0]] | 1) != !0);
         let is_interleaved = components.len() > 1;
         let mut dummy_block = [0i16; 64];
         let mut huffman = HuffmanDecoder::new();
@@ -958,7 +1162,28 @@ impl<R: Read> Decoder<R> {
                 for (i, component) in components.iter().enumerate() {
                     for v_pos in 0..mcu_vertical_samples[i] {
                         for h_pos in 0..mcu_horizontal_samples[i] {
-                            let coefficients = if is_progressive {
+                            if is_scaled_progressive {
+                                let by = (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
+                                let bx = (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
+                                let sc = if already_finished[i] {
+                                    None
+                                } else {
+                                    Some(&mut self.scaled_coefficients[scan.component_indices[i]])
+                                };
+                                let tables = (
+                                    self.dc_huffman_tables[scan.dc_table_indices[i]].as_ref(),
+                                    self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref(),
+                                );
+                                match component.dct_scale {
+                                    1 => decode_scaled_block_n::<_, 1>(&mut self.reader, sc, (bx, by), (read_nz, write_nz), &mut huffman, tables, scan, &mut eob_run, &mut dc_predictors[i])?,
+                                    2 => decode_scaled_block_n::<_, 4>(&mut self.reader, sc, (bx, by), (read_nz, write_nz), &mut huffman, tables, scan, &mut eob_run, &mut dc_predictors[i])?,
+                                    4 => decode_scaled_block_n::<_, 16>(&mut self.reader, sc, (bx, by), (read_nz, write_nz), &mut huffman, tables, scan, &mut eob_run, &mut dc_predictors[i])?,
+                                    _ => unreachable!(),
+                                }
+                                continue;
+                            }
+
+                            let coefficients: &mut [i16; 64] = if is_progressive {
                                 let block_y = (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
                                 let block_x = (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
                                 let block_offset =
@@ -987,29 +1212,16 @@ impl<R: Read> Decoder<R> {
                             .try_into()
                             .unwrap();
 
-                            if scan.successive_approximation_high == 0 {
-                                decode_block(
-                                    &mut self.reader,
-                                    coefficients,
-                                    &mut huffman,
-                                    self.dc_huffman_tables[scan.dc_table_indices[i]].as_ref(),
-                                    self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref(),
-                                    scan.spectral_selection.clone(),
-                                    scan.successive_approximation_low,
-                                    &mut eob_run,
-                                    &mut dc_predictors[i],
-                                )?;
-                            } else {
-                                decode_block_successive_approximation(
-                                    &mut self.reader,
-                                    coefficients,
-                                    &mut huffman,
-                                    self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref(),
-                                    scan.spectral_selection.clone(),
-                                    scan.successive_approximation_low,
-                                    &mut eob_run,
-                                )?;
-                            }
+                            decode_scan_block(
+                                &mut self.reader,
+                                coefficients,
+                                &mut huffman,
+                                self.dc_huffman_tables[scan.dc_table_indices[i]].as_ref(),
+                                self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref(),
+                                scan,
+                                &mut eob_run,
+                                &mut dc_predictors[i],
+                            )?;
                         }
                     }
                 }
@@ -1082,10 +1294,182 @@ impl<R: Read> Decoder<R> {
     }
 }
 
+#[inline(always)]
+fn refine_coeff(c: &mut i16, bit: i16) -> Result<()> {
+    if *c & bit == 0 {
+        *c = if *c > 0 { c.checked_add(bit) } else { c.checked_sub(bit) }
+            .ok_or_else(|| Error::Format("Coefficient overflow".to_owned()))?;
+    }
+    Ok(())
+}
+
+trait BlockStorage: Sized {
+    fn set(&mut self, zz: u8, val: i16);
+    fn refine_dc(&mut self, bit: i16);
+    fn is_ac_zero(&self, zz: u8) -> bool;
+    fn refine_ac(&mut self, zz: u8, bit: i16) -> Result<()>;
+    #[inline(always)]
+    fn refine_eob<R: Read>(
+        &mut self,
+        reader: &mut R,
+        huffman: &mut HuffmanDecoder,
+        range: Range<u8>,
+        bit: i16,
+    ) -> Result<()> {
+        refine_non_zeroes(reader, self, huffman, range, 64, bit).map(|_| ())
+    }
+}
+
+impl BlockStorage for [i16; 64] {
+    #[inline(always)]
+    fn set(&mut self, zz: u8, val: i16) { self[UNZIGZAG[zz as usize] as usize] = val; }
+    #[inline(always)]
+    fn refine_dc(&mut self, bit: i16) { self[0] |= bit; }
+    #[inline(always)]
+    fn is_ac_zero(&self, zz: u8) -> bool { self[UNZIGZAG[zz as usize] as usize] == 0 }
+    #[inline(always)]
+    fn refine_ac(&mut self, zz: u8, bit: i16) -> Result<()> {
+        refine_coeff(&mut self[UNZIGZAG[zz as usize] as usize], bit)
+    }
+}
+
+struct ScaledBlock<'a, const N: usize, const TRACK_NZ: bool> {
+    slots: &'a mut [i16; N],
+    nz: u64,
+}
+
+impl<const N: usize, const TRACK_NZ: bool> BlockStorage for ScaledBlock<'_, N, TRACK_NZ> {
+    #[inline(always)]
+    fn set(&mut self, zz: u8, val: i16) {
+        let s = slot_map_for::<N>()[zz as usize] as usize;
+        if s < N {
+            self.slots[s] = val;
+        }
+        if TRACK_NZ {
+            if val != 0 { self.nz |= 1u64 << zz; } else { self.nz &= !(1u64 << zz); }
+        }
+    }
+    #[inline(always)]
+    fn refine_dc(&mut self, bit: i16) { self.slots[0] |= bit; }
+    #[inline(always)]
+    fn is_ac_zero(&self, zz: u8) -> bool { (self.nz & (1u64 << zz)) == 0 }
+    #[inline(always)]
+    fn refine_ac(&mut self, zz: u8, bit: i16) -> Result<()> {
+        let s = slot_map_for::<N>()[zz as usize] as usize;
+        if s < N {
+            refine_coeff(&mut self.slots[s], bit)?;
+        }
+        Ok(())
+    }
+    #[inline(always)]
+    fn refine_eob<R: Read>(
+        &mut self,
+        reader: &mut R,
+        huffman: &mut HuffmanDecoder,
+        range: Range<u8>,
+        bit: i16,
+    ) -> Result<()> {
+        if range.start >= range.end {
+            return Ok(());
+        }
+        let mut m = self.nz & ((!0u64) << range.start) & ((!0u64) >> (64 - range.end));
+        let kept = match N { 4 => KEPT_AC_MASK_2, 16 => KEPT_AC_MASK_4, _ => 0 };
+        if (m & kept) == 0 {
+            for _ in 0..m.count_ones() {
+                huffman.get_bits(reader, 1)?;
+            }
+        } else {
+            while m != 0 {
+                let i = m.trailing_zeros() as u8;
+                m &= m - 1;
+                if huffman.get_bits(reader, 1)? == 1 {
+                    self.refine_ac(i, bit)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn decode_block<R: Read>(
+#[inline(always)]
+fn decode_scaled_block_n<R: Read, const N: usize>(
     reader: &mut R,
-    coefficients: &mut [i16; 64],
+    sc: Option<&mut ScaledComponent>,
+    (bx, by): (usize, usize),
+    (read_nz, write_nz): (bool, bool),
+    huffman: &mut HuffmanDecoder,
+    (dc_table, ac_table): (Option<&HuffmanTable>, Option<&HuffmanTable>),
+    scan: &ScanInfo,
+    eob_run: &mut u16,
+    dc_predictor: &mut i16,
+) -> Result<()> {
+    let mut dummy = [0i16; N];
+    let (slots, nz_in, nz_out) = match sc {
+        Some(c) => c.block_mut::<N>(bx, by, read_nz, write_nz),
+        None => (&mut dummy, 0, None),
+    };
+    if let Some(out) = nz_out {
+        let mut block = ScaledBlock::<N, true> { slots, nz: nz_in };
+        decode_scan_block(reader, &mut block, huffman, dc_table, ac_table, scan, eob_run, dc_predictor)?;
+        *out = block.nz;
+        Ok(())
+    } else {
+        let mut block = ScaledBlock::<N, false> { slots, nz: nz_in };
+        decode_scan_block(reader, &mut block, huffman, dc_table, ac_table, scan, eob_run, dc_predictor)
+    }
+}
+
+fn skip_scan_entropy_data<R: Read>(reader: &mut R) -> Result<Marker> {
+    loop {
+        if read_u8(reader)? != 0xFF {
+            continue;
+        }
+        let mut next_byte = read_u8(reader)?;
+        if next_byte == 0x00 {
+            continue;
+        }
+        while next_byte == 0xFF {
+            next_byte = read_u8(reader)?;
+        }
+        if next_byte == 0x00 {
+            return Err(Error::Format("FF 00 found where marker was expected".to_owned()));
+        }
+        let marker = Marker::from_u8(next_byte).unwrap();
+        if !matches!(marker, Marker::RST(_)) {
+            return Ok(marker);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_scan_block<R: Read, B: BlockStorage>(
+    reader: &mut R,
+    block: &mut B,
+    huffman: &mut HuffmanDecoder,
+    dc_table: Option<&HuffmanTable>,
+    ac_table: Option<&HuffmanTable>,
+    scan: &ScanInfo,
+    eob_run: &mut u16,
+    dc_predictor: &mut i16,
+) -> Result<()> {
+    if scan.successive_approximation_high == 0 {
+        decode_block(
+            reader, block, huffman, dc_table, ac_table,
+            scan.spectral_selection.clone(), scan.successive_approximation_low, eob_run, dc_predictor,
+        )
+    } else {
+        decode_block_successive_approximation(
+            reader, block, huffman, ac_table,
+            scan.spectral_selection.clone(), scan.successive_approximation_low, eob_run,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_block<R: Read, B: BlockStorage>(
+    reader: &mut R,
+    coefficients: &mut B,
     huffman: &mut HuffmanDecoder,
     dc_table: Option<&HuffmanTable>,
     ac_table: Option<&HuffmanTable>,
@@ -1094,8 +1478,6 @@ fn decode_block<R: Read>(
     eob_run: &mut u16,
     dc_predictor: &mut i16,
 ) -> Result<()> {
-    debug_assert_eq!(coefficients.len(), 64);
-
     if spectral_selection.start == 0 {
         // Section F.2.2.1
         // Figure F.12
@@ -1115,7 +1497,7 @@ fn decode_block<R: Read>(
         // Malicious JPEG files can cause this add to overflow, therefore we use wrapping_add.
         // One example of such a file is tests/crashtest/images/dc-predictor-overflow.jpg
         *dc_predictor = dc_predictor.wrapping_add(diff);
-        coefficients[0] = *dc_predictor << successive_approximation_low;
+        coefficients.set(0, *dc_predictor << successive_approximation_low);
     }
 
     let mut index = cmp::max(spectral_selection.start, 1);
@@ -1134,7 +1516,7 @@ fn decode_block<R: Read>(
                 break;
             }
 
-            coefficients[UNZIGZAG[index as usize] as usize] = value << successive_approximation_low;
+            coefficients.set(index, value << successive_approximation_low);
             index += 1;
         } else {
             let byte = huffman.decode(reader, ac_table.unwrap())?;
@@ -1161,8 +1543,10 @@ fn decode_block<R: Read>(
                     break;
                 }
 
-                coefficients[UNZIGZAG[index as usize] as usize] =
-                    huffman.receive_extend(reader, s)? << successive_approximation_low;
+                coefficients.set(
+                    index,
+                    huffman.receive_extend(reader, s)? << successive_approximation_low,
+                );
                 index += 1;
             }
         }
@@ -1171,32 +1555,29 @@ fn decode_block<R: Read>(
     Ok(())
 }
 
-fn decode_block_successive_approximation<R: Read>(
+fn decode_block_successive_approximation<R: Read, B: BlockStorage>(
     reader: &mut R,
-    coefficients: &mut [i16; 64],
+    coefficients: &mut B,
     huffman: &mut HuffmanDecoder,
     ac_table: Option<&HuffmanTable>,
     spectral_selection: Range<u8>,
     successive_approximation_low: u8,
     eob_run: &mut u16,
 ) -> Result<()> {
-    debug_assert_eq!(coefficients.len(), 64);
-
     let bit = 1 << successive_approximation_low;
 
     if spectral_selection.start == 0 {
         // Section G.1.2.1
 
         if huffman.get_bits(reader, 1)? == 1 {
-            coefficients[0] |= bit;
+            coefficients.refine_dc(bit);
         }
     } else {
         // Section G.1.2.3
 
         if *eob_run > 0 {
             *eob_run -= 1;
-            refine_non_zeroes(reader, coefficients, huffman, spectral_selection, 64, bit)?;
-            return Ok(());
+            return coefficients.refine_eob(reader, huffman, spectral_selection, bit);
         }
 
         let mut index = spectral_selection.start;
@@ -1206,7 +1587,7 @@ fn decode_block_successive_approximation<R: Read>(
             let r = byte >> 4;
             let s = byte & 0x0f;
 
-            let mut zero_run_length = r;
+            let zero_run_length = r;
             let mut value = 0;
 
             match s {
@@ -1214,9 +1595,6 @@ fn decode_block_successive_approximation<R: Read>(
                     match r {
                         15 => {
                             // Run length of 16 zero coefficients.
-                            // We don't need to do anything special here, zero_run_length is 15
-                            // and then value (which is zero) gets written, resulting in 16
-                            // zero coefficients.
                         }
                         _ => {
                             *eob_run = (1 << r) - 1;
@@ -1225,8 +1603,13 @@ fn decode_block_successive_approximation<R: Read>(
                                 *eob_run += huffman.get_bits(reader, r)?;
                             }
 
-                            // Force end of block.
-                            zero_run_length = 64;
+                            coefficients.refine_eob(
+                                reader,
+                                huffman,
+                                index..spectral_selection.end,
+                                bit,
+                            )?;
+                            break;
                         }
                     }
                 }
@@ -1247,7 +1630,7 @@ fn decode_block_successive_approximation<R: Read>(
             index = refine_non_zeroes(reader, coefficients, huffman, range, zero_run_length, bit)?;
 
             if value != 0 {
-                coefficients[UNZIGZAG[index as usize] as usize] = value;
+                coefficients.set(index, value);
             }
 
             index += 1;
@@ -1257,40 +1640,26 @@ fn decode_block_successive_approximation<R: Read>(
     Ok(())
 }
 
-fn refine_non_zeroes<R: Read>(
+fn refine_non_zeroes<R: Read, B: BlockStorage>(
     reader: &mut R,
-    coefficients: &mut [i16; 64],
+    coefficients: &mut B,
     huffman: &mut HuffmanDecoder,
     range: Range<u8>,
     zrl: u8,
     bit: i16,
 ) -> Result<u8> {
-    debug_assert_eq!(coefficients.len(), 64);
-
     let last = range.end - 1;
     let mut zero_run_length = zrl;
 
     for i in range {
-        let index = UNZIGZAG[i as usize] as usize;
-
-        let coefficient = &mut coefficients[index];
-
-        if *coefficient == 0 {
+        if coefficients.is_ac_zero(i) {
             if zero_run_length == 0 {
                 return Ok(i);
             }
 
             zero_run_length -= 1;
-        } else if huffman.get_bits(reader, 1)? == 1 && *coefficient & bit == 0 {
-            if *coefficient > 0 {
-                *coefficient = coefficient
-                    .checked_add(bit)
-                    .ok_or_else(|| Error::Format("Coefficient overflow".to_owned()))?;
-            } else {
-                *coefficient = coefficient
-                    .checked_sub(bit)
-                    .ok_or_else(|| Error::Format("Coefficient overflow".to_owned()))?;
-            }
+        } else if huffman.get_bits(reader, 1)? == 1 {
+            coefficients.refine_ac(i, bit)?;
         }
     }
 
