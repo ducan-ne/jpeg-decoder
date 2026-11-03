@@ -23,7 +23,9 @@ const MAX_SCANS: usize = 100;
 const MAX_SCALED_CHUNK_BYTES: usize = 256 * 1024;
 
 mod lossless;
-use self::lossless::compute_image_lossless;
+use self::lossless::{compute_image_lossless, compute_image_lossless_rows};
+
+type DecodedPlanes = (Vec<Vec<u8>>, Vec<Vec<u16>>);
 
 #[rustfmt::skip]
 const UNZIGZAG: [u8; 64] = [
@@ -294,8 +296,8 @@ impl<R: Read> Decoder<R> {
 
     /// Returns metadata about the image.
     ///
-    /// The returned value will be `None` until a call to either `read_info` or `decode` has
-    /// returned `Ok`.
+    /// The returned value will be `None` until a call to `read_info`, `decode`, or `decode_rows`
+    /// has returned `Ok`.
     pub fn info(&self) -> Option<ImageInfo> {
         match self.frame {
             Some(ref frame) => {
@@ -323,14 +325,14 @@ impl<R: Read> Decoder<R> {
 
     /// Returns raw exif data, starting at the TIFF header, if the image contains any.
     ///
-    /// The returned value will be `None` until a call to `decode` has returned `Ok`.    
+    /// The returned value will be `None` until a call to `decode` or `decode_rows` has returned `Ok`.
     pub fn exif_data(&self) -> Option<&[u8]> {
         self.exif_data.as_deref()
     }
 
     /// Returns the raw XMP packet if there is any.
     ///
-    /// The returned value will be `None` until a call to `decode` has returned `Ok`.
+    /// The returned value will be `None` until a call to `decode` or `decode_rows` has returned `Ok`.
     pub fn xmp_data(&self) -> Option<&[u8]> {
         self.xmp_data.as_deref()
     }
@@ -403,9 +405,15 @@ impl<R: Read> Decoder<R> {
     ///
     /// To generate a thumbnail of an exact size, pass the desired size and
     /// then scale to the final size using a traditional resampling algorithm.
+    ///
+    /// Lossless JPEGs (`CodingProcess::Lossless`) do not use DCT blocks and are always decoded at
+    /// their full dimensions.
     pub fn scale(&mut self, requested_width: u16, requested_height: u16) -> Result<(u16, u16)> {
         self.read_info()?;
         let frame = self.frame.as_mut().unwrap();
+        if frame.coding_process == CodingProcess::Lossless {
+            return Ok((frame.output_size.width, frame.output_size.height));
+        }
         let idct_size = crate::idct::choose_idct_size(
             frame.image_size,
             Dimensions {
@@ -418,8 +426,8 @@ impl<R: Read> Decoder<R> {
     }
 
     /// Returns the maximum number of bytes that progressive coefficient buffers will allocate
-    /// during `decode` for the current frame and `scale`, or `0` if the frame is not progressive
-    /// or metadata has not been read yet.
+    /// during `decode` or `decode_rows` for the current frame and `scale`, or `0` if the frame is
+    /// not progressive or metadata has not been read yet.
     pub fn progressive_coeff_bytes(&self) -> u64 {
         let frame = match self.frame {
             Some(ref frame) if frame.coding_process == CodingProcess::DctProgressive => frame,
@@ -437,17 +445,58 @@ impl<R: Read> Decoder<R> {
 
     /// Decodes the image and returns the decoded pixels if successful.
     pub fn decode(&mut self) -> Result<Vec<u8>> {
-        WorkerScope::with(|worker| self.decode_internal(false, worker))
+        let (planes, planes_u16) =
+            WorkerScope::with(|worker| self.decode_internal(false, worker))?;
+        let frame = self.frame.as_ref().unwrap();
+        if frame.coding_process == CodingProcess::Lossless {
+            compute_image_lossless(frame, planes_u16)
+        } else {
+            compute_image(
+                &frame.components,
+                planes,
+                frame.output_size,
+                self.determine_color_transform(),
+            )
+        }
+    }
+
+    /// Decodes the image and delivers each output row to `on_row` in top-to-bottom order
+    /// without allocating a full-image output buffer.
+    ///
+    /// Each slice passed to `on_row` matches the corresponding row of [`Decoder::decode`] at the
+    /// same [`Decoder::scale`]. For DCT frames and 8-bit lossless frames, each row has length
+    /// `info.width * info.pixel_format.pixel_bytes()`. For lossless frames
+    /// (`CodingProcess::Lossless`) with sample precision other than 8 bits, each sample is stored
+    /// as two native-endian bytes (`u16`), so each row has length `info.width * components * 2`
+    /// (2 bytes/pixel for grayscale, 6 for RGB, 8 for CMYK).
+    pub fn decode_rows<F>(&mut self, mut on_row: F) -> Result<()>
+    where
+        F: FnMut(&[u8]),
+    {
+        let (planes, planes_u16) =
+            WorkerScope::with(|worker| self.decode_internal(false, worker))?;
+        let frame = self.frame.as_ref().unwrap();
+        if frame.coding_process == CodingProcess::Lossless {
+            compute_image_lossless_rows(frame, planes_u16, &mut on_row)
+        } else {
+            compute_image_rows(
+                &frame.components,
+                planes,
+                frame.output_size,
+                self.determine_color_transform(),
+                &mut on_row,
+            )
+        }
     }
 
     fn decode_internal(
         &mut self,
         stop_after_metadata: bool,
         worker_scope: &WorkerScope,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DecodedPlanes> {
         if stop_after_metadata && self.frame.is_some() {
             // The metadata has already been read.
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         } else if self.frame.is_none()
             && (read_u8(&mut self.reader)? != 0xFF
                 || Marker::from_u8(read_u8(&mut self.reader)?) != Some(Marker::SOI))
@@ -527,7 +576,7 @@ impl<R: Read> Decoder<R> {
                     self.frame = Some(frame);
 
                     if stop_after_metadata {
-                        return Ok(Vec::new());
+                        return Ok((Vec::new(), Vec::new()));
                     }
 
                     planes = vec![Vec::new(); component_count];
@@ -821,7 +870,7 @@ impl<R: Read> Decoder<R> {
         worker: &mut dyn Worker,
         mut planes: Vec<Vec<u8>>,
         planes_u16: Vec<Vec<u16>>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DecodedPlanes> {
         if self.frame.is_none() {
             return Err(Error::Format(
                 "end of image encountered before frame".to_owned(),
@@ -906,18 +955,10 @@ impl<R: Read> Decoder<R> {
                 worker.append_rows(&mut tasks)?;
                 planes[i] = worker.get_result(i)?;
             }
+            self.coefficients = Vec::new();
         }
 
-        if frame.coding_process == CodingProcess::Lossless {
-            compute_image_lossless(frame, planes_u16)
-        } else {
-            compute_image(
-                &frame.components,
-                planes,
-                frame.output_size,
-                self.determine_color_transform(),
-            )
-        }
+        Ok((planes, planes_u16))
     }
 
     fn determine_color_transform(&self) -> ColorTransform {
@@ -1715,6 +1756,55 @@ fn compute_image(
         Ok(decoded)
     } else {
         compute_image_parallel(components, data, output_size, color_transform)
+    }
+}
+
+fn compute_image_rows<F>(
+    components: &[Component],
+    data: Vec<Vec<u8>>,
+    output_size: Dimensions,
+    color_transform: ColorTransform,
+    on_row: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    if data.is_empty() || data.iter().any(Vec::is_empty) {
+        return Err(Error::Format("not all components have data".to_owned()));
+    }
+
+    if components.len() == 1 {
+        let component = &components[0];
+        let decoded = &data[0];
+        let width = component.size.width as usize;
+        let height = component.size.height as usize;
+        let line_stride = component.block_size.width as usize * component.dct_scale;
+
+        for y in 0..height {
+            let start = y * line_stride;
+            on_row(&decoded[start..start + width]);
+        }
+        Ok(())
+    } else {
+        let color_convert_func = choose_color_convert_func(components.len(), color_transform)?;
+        let upsampler = Upsampler::new(components, output_size.width, output_size.height)?;
+        let width = usize::from(output_size.width);
+        let height = usize::from(output_size.height);
+        let mut line_buffers = upsampler.create_line_buffers();
+        let mut line = vec![0u8; width * components.len()];
+
+        for row in 0..height {
+            upsampler.upsample_and_interleave_row_buffered(
+                &data,
+                row,
+                width,
+                &mut line,
+                color_convert_func,
+                &mut line_buffers,
+            );
+            on_row(&line);
+        }
+        Ok(())
     }
 }
 

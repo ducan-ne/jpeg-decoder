@@ -44,11 +44,25 @@ impl Upsampler {
         })
     }
 
-    pub fn upsample_and_interleave_row(&self, component_data: &[Vec<u8>], row: usize, output_width: usize, output: &mut [u8], color_convert: fn(&[Vec<u8>], &mut [u8])) {
-        let component_count = component_data.len();
-        let mut line_buffers = vec![vec![0u8; self.line_buffer_size]; component_count];
+    pub fn create_line_buffers(&self) -> Vec<Vec<u8>> {
+        vec![vec![0u8; self.line_buffer_size]; self.components.len()]
+    }
 
-        debug_assert_eq!(component_count, self.components.len());
+    pub fn upsample_and_interleave_row(&self, component_data: &[Vec<u8>], row: usize, output_width: usize, output: &mut [u8], color_convert: fn(&[Vec<u8>], &mut [u8])) {
+        let mut line_buffers = self.create_line_buffers();
+        self.upsample_and_interleave_row_buffered(
+            component_data,
+            row,
+            output_width,
+            output,
+            color_convert,
+            &mut line_buffers,
+        );
+    }
+
+    pub fn upsample_and_interleave_row_buffered(&self, component_data: &[Vec<u8>], row: usize, output_width: usize, output: &mut [u8], color_convert: fn(&[Vec<u8>], &mut [u8]), line_buffers: &mut [Vec<u8>]) {
+        debug_assert_eq!(component_data.len(), self.components.len());
+        debug_assert_eq!(line_buffers.len(), self.components.len());
 
         for (i, component) in self.components.iter().enumerate() {
             component.upsampler.upsample_row(&component_data[i],
@@ -59,7 +73,7 @@ impl Upsampler {
                                              output_width,
                                              &mut line_buffers[i]);
         }
-        color_convert(&line_buffers, output);
+        color_convert(line_buffers, output);
     }
 }
 

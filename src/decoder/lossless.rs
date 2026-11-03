@@ -249,6 +249,46 @@ pub fn compute_image_lossless(frame: &FrameInfo, mut data: Vec<Vec<u16>>) -> Res
     }
 }
 
+pub fn compute_image_lossless_rows<F>(
+    frame: &FrameInfo,
+    data: Vec<Vec<u16>>,
+    on_row: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    if data.is_empty() || data.iter().any(Vec::is_empty) {
+        return Err(Error::Format("not all components have data".to_owned()));
+    }
+    let width = usize::from(frame.output_size.width);
+    let height = usize::from(frame.output_size.height);
+    let ncomp = frame.components.len();
+    let bytes_per_sample = if frame.precision == 8 { 1 } else { 2 };
+    let mut line = vec![0u8; width * ncomp * bytes_per_sample];
+
+    for y in 0..height {
+        let row_start = y * width;
+        if frame.precision == 8 {
+            for x in 0..width {
+                for (i, plane) in data.iter().enumerate() {
+                    line[x * ncomp + i] = plane[row_start + x] as u8;
+                }
+            }
+        } else {
+            for x in 0..width {
+                for (i, plane) in data.iter().enumerate() {
+                    let bytes = plane[row_start + x].to_ne_bytes();
+                    let off = (x * ncomp + i) * 2;
+                    line[off] = bytes[0];
+                    line[off + 1] = bytes[1];
+                }
+            }
+        }
+        on_row(&line);
+    }
+    Ok(())
+}
+
 fn convert_to_u8(frame: &FrameInfo, data: Vec<u16>) -> Vec<u8> {
     if frame.precision == 8 {
         data.iter().map(|x| *x as u8).collect()
