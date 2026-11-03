@@ -245,6 +245,8 @@ pub struct Decoder<R> {
     // Used for progressive JPEGs.
     coefficients: Vec<Vec<i16>>,
     scaled_coefficients: Vec<ScaledComponent>,
+    #[cfg(test)]
+    force_unscaled_coeffs: bool,
     // Bitmask of which coefficients has been completely decoded.
     coefficients_finished: [u64; MAX_COMPONENTS],
 
@@ -272,6 +274,8 @@ impl<R: Read> Decoder<R> {
             psir_data: None,
             coefficients: Vec::new(),
             scaled_coefficients: Vec::new(),
+            #[cfg(test)]
+            force_unscaled_coeffs: false,
             coefficients_finished: [0; MAX_COMPONENTS],
             decoding_buffer_size_limit: usize::MAX,
         }
@@ -542,7 +546,17 @@ impl<R: Read> Decoder<R> {
                     let frame = self.frame.clone().unwrap();
                     let scan = parse_sos(&mut self.reader, &frame)?;
                     let use_scaled_prog = frame.coding_process == CodingProcess::DctProgressive
-                        && frame.components[0].dct_scale < 8;
+                        && frame.components[0].dct_scale < 8
+                        && {
+                            #[cfg(test)]
+                            {
+                                !self.force_unscaled_coeffs
+                            }
+                            #[cfg(not(test))]
+                            {
+                                true
+                            }
+                        };
 
                     if frame.coding_process == CodingProcess::DctProgressive
                         && !use_scaled_prog
@@ -1875,3 +1889,7 @@ fn stbi_f2f(x: f32) -> i32 {
 fn clamp_fixed_point(value: i32) -> u8 {
     (value >> FIXED_POINT_OFFSET).min(255).max(0) as u8
 }
+
+#[cfg(test)]
+#[path = "decoder_tests.rs"]
+mod decoder_tests;
